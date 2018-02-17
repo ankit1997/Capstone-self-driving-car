@@ -207,7 +207,8 @@ class AutoSteer:
 
         with tf.Session() as session:
             self.saver.restore(session, self.model_file)
-            prediction = session.run(self.prediction, feed_dict={self.images: x})
+            prediction = session.run(self.prediction, 
+                                    feed_dict={self.images: x, self.keep_prob: 1.0, self.is_training: False})
 
         return prediction
 
