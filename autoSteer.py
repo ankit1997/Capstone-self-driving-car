@@ -155,20 +155,14 @@ class AutoSteer:
         num_units = (inp.shape[1] * inp.shape[2] * inp.shape[3]).value
         return tf.reshape(inp, [-1, num_units], name='flatten-layer')
 
-    def weight(self, name, shape):
-        return tf.get_variable(name, shape)
-
-    def bias(self, name, shape):
-        return tf.get_variable(name, shape, initializer=tf.constant_initializer(0.1))
-
-    def train(self, x, y, epochs=1000, log_step=10, resume=False):
+    def train(self, path, epochs=1000, log_step=10, resume=False):
         '''
             Trains the end-to-end model on provided data.
             Args:
-                x : Numpy array of shape (Batch, Height, Width, Channels)
-                y : Numpy array of shape (Batch, 1)
+                path : Path to dataset directory
         '''
 
+        x, y = self._read_data(path)
         data = Data(x, y)
 
         with tf.Session() as session:
@@ -211,6 +205,26 @@ class AutoSteer:
                                     feed_dict={self.images: x, self.keep_prob: 1.0, self.is_training: False})
 
         return prediction
+
+    def weight(self, name, shape):
+        return tf.get_variable(name, shape)
+
+    def bias(self, name, shape):
+        return tf.get_variable(name, shape, initializer=tf.constant_initializer(0.1))
+
+    def _read_data(self, path):
+        '''
+            Reads dataset from directory.
+            Args:
+                path : Path to dataset directory.
+            Returns:
+                (x, y) tuple where:
+                    x : Numpy array of shape (Batch, Height, Width, Channels)
+                    y : Numpy array of shape (Batch, 1)
+        '''
+        assert os.path.isdir(path), "{} is not a valid directory.".format(path)
+
+        raise NotImplementedError
 
     def __str__(self):
         s = ""
