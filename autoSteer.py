@@ -33,7 +33,7 @@ class AutoSteer:
     def build_model(self, image_shape):
         '''
         Builds the end to end self driving car model.
-        The primary input is the image of the front view of road and the output is steering value.
+        The primary input is the image of the front view of road and the output is steering command - left/right/straight.
         '''
         
         # Reset the tensorflow graph before building the model.
@@ -41,28 +41,28 @@ class AutoSteer:
 
         # Define input/output placeholders
         self.images = tf.placeholder(tf.float32, shape=(None, *image_shape), name='camera-view')
-        self.steering = tf.placeholder(tf.float32, shape=(None, 1), name='correct-steering')
+        self.steering = tf.placeholder(tf.int32, shape=(None,), name='correct-steering')
         self.keep_prob = tf.placeholder(tf.float32, name='keep-prob')
         self.is_training = tf.placeholder(tf.bool, name='is_training')
 
         # Define convolution architecture parameters.
         # Parameters : (kernel size, number of out channels, stride, padding)
-        cnn_parameters = [
-            CnnParams(3, 16, 1, "SAME", tf.nn.elu),
-            CnnParams(3, 32, 1, "VALID", tf.nn.elu),
-            CnnParams(3, 64, 1, "SAME", tf.nn.elu),
-            CnnParams(3, 128, 1, "SAME", tf.nn.elu),
+        self.cnn_parameters = [
+            CnnParams(3, 16, 1, "VALID", tf.nn.elu),
+            CnnParams(3, 32, 1, "SAME", tf.nn.elu),
+            CnnParams(3, 64, 1, "VALID", tf.nn.elu),
+            CnnParams(3, 128, 1, "VALID", tf.nn.elu),
         ]
 
         # Define dense layers parameters.
         # Parameters : (num_units, activation, *dropout(keep prob))
-        dense_parameters = [
+        self.dense_parameters = [
             DenseParams(256, tf.nn.elu, None),
             DenseParams(128, tf.nn.elu, self.keep_prob),
             DenseParams(64, tf.nn.elu, None),
             DenseParams(32, tf.nn.elu, self.keep_prob),
             DenseParams(8, tf.nn.elu, None),
-            DenseParams(1, tf.nn.tanh, None)
+            DenseParams(3, tf.nn.softmax, None)
         ]
 
         # Batch normalization layer
@@ -70,37 +70,40 @@ class AutoSteer:
         layer = tf.layers.batch_normalization(layer, training=self.is_training)
 
         # Build CNN layers
-        for i, param in enumerate(cnn_parameters):
-            layer = self.cnn_layer(layer, param, i)
+        for i in range(len(self.cnn_parameters)):
+            layer = self.cnn_layer(layer, i)
 
         # Flat the volume for dense layers
         layer = self.flatten_layer(layer)
 
         # Build Dense layers
-        for i, param in enumerate(dense_parameters):
-            layer = self.dense_layer(layer, param, i)
+        for i in range(len(self.dense_parameters)):
+            layer = self.dense_layer(layer, i)
 
         self.prediction = layer
 
+        # Get image showing features extracted by CNN
+        self.visualize = self.visualBackProp()
+        print(self.visualize)
+
     def define_loss(self):
-        self.loss = tf.losses.mean_squared_error(labels=self.steering, predictions=self.prediction)
+        self.loss = tf.losses.sparse_softmax_cross_entropy(labels=self.steering, logits=self.prediction)
 
     def define_optimizer(self, learning_rate=0.001):
         update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
         with tf.control_dependencies(update_ops):
             self.train_step = tf.train.AdamOptimizer(learning_rate).minimize(self.loss)
 
-    def cnn_layer(self, inp, cnn_param, layer_num):
+    def cnn_layer(self, inp, layer_num):
         '''
             Applies a convolution layer to input volume.
             Args:
                 inp : Input volume Tensor
-                cnn_param : a CnnParams object
                 layer_num : Layer number (for scope and var name)
             Returns:
                 Output volume
         '''
-
+        cnn_param = self.cnn_parameters[layer_num]
         inp_channels = inp.shape[-1].value
 
         with tf.variable_scope("Convolution-layer-{}".format(layer_num)):
@@ -113,19 +116,21 @@ class AutoSteer:
             if cnn_param.activation:
                 conv = cnn_param.activation(conv)
 
+            # name the tensor
+            conv = tf.identity(conv, name='layer-output')
+
         return conv
 
-    def dense_layer(self, inp, dense_param, layer_num):
+    def dense_layer(self, inp, layer_num):
         '''
             Applies a dense layer to input tensor.
             Args:
                 inp : Input Tensor
-                dense_param : a DenseParams object
                 layer_num : Layer number (for scope and var name)
             Returns:
                 Output tensor
         '''
-
+        dense_param = self.dense_parameters[layer_num]
         inp_units = inp.shape[-1].value
 
         with tf.variable_scope("Dense-layer-{}".format(layer_num)):
@@ -155,6 +160,59 @@ class AutoSteer:
         num_units = (inp.shape[1] * inp.shape[2] * inp.shape[3]).value
         return tf.reshape(inp, [-1, num_units], name='flatten-layer')
 
+    def visualBackProp(self):
+        '''
+            Implementation of VisualBackProp: efficient visualization of CNNs.
+        '''
+
+        # Get names of output op of all convolution layers
+        operations = tf.get_default_graph().get_operations()
+        op_names = [op.name for op in operations]
+        cnn_op_names = list(filter(lambda name: name.startswith("Convolution-layer") and name.endswith("layer-output"), op_names))
+        num_cnn_layers = len(cnn_op_names)
+
+        # Just verifying that all layers were built successfully.
+        assert num_cnn_layers == len(self.cnn_parameters)
+
+        # Get tensor operations of all conv layers
+        cnn_ops = [tf.get_default_graph().get_tensor_by_name(cnn_op_name+":0") for cnn_op_name in cnn_op_names]
+        print(cnn_ops)
+
+        with tf.variable_scope("VisualBackProp"):
+            # calculate average feature map
+            average_fmaps = [tf.expand_dims(tf.reduce_mean(cnn_op, axis=-1), axis=-1) for cnn_op in cnn_ops]
+
+            # up-scale last average feature map
+            previous = self._visual_back_prop_step(average_fmaps[-1], average_fmaps[-2], len(average_fmaps)-1)
+            
+            for i in range(len(average_fmaps)-2, 0, -1):
+                pointwise_mul = tf.multiply(previous, average_fmaps[i], name='pointwise-mul')
+                previous = self._visual_back_prop_step(pointwise_mul, average_fmaps[i-1], i)
+
+            # up-scale to original image
+            mask = self._visual_back_prop_step(previous, self.images, 0)
+
+            # normalize mask to range [0, 1]
+            with tf.variable_scope("normalize-mask"):
+                normalized_mask = tf.div(tf.subtract(mask, tf.reduce_min(mask)), tf.subtract(tf.reduce_max(mask), tf.reduce_min(mask)))
+
+        return normalized_mask
+
+    def _visual_back_prop_step(self, current_map, previous_map, layer_num):
+        '''
+            Helper function for deconvolution operation of visualbackprop model.
+        '''
+
+        cnn_param = self.cnn_parameters[layer_num]
+        k = cnn_param.kernel_size
+        s = cnn_param.stride
+        
+        return tf.nn.conv2d_transpose(current_map,
+                filter=tf.constant(1.0, shape=[k, k, 1, 1], name="w-deconv-{}".format(layer_num), dtype=tf.float32),
+                output_shape=[tf.shape(previous_map)[0], previous_map.shape[1], previous_map.shape[2], 1],
+                strides=[1, s, s, 1],
+                padding=cnn_param.padding)
+        
     def train(self, path, epochs=1000, log_step=10, resume=False):
         '''
             Trains the end-to-end model on provided data.
@@ -236,4 +294,3 @@ class AutoSteer:
 # Testing
 if __name__ == '__main__':
     autoSteer = AutoSteer((256, 256, 4))
-    print(autoSteer)
