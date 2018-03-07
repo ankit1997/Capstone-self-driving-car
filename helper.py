@@ -1,4 +1,7 @@
+import os
 import numpy as np
+import pandas as pd
+from PIL import Image
 import tensorflow as tf
 
 class CnnParams:
@@ -16,90 +19,49 @@ class DenseParams:
         self.dropout = params[2]
 
 class Data:
-    def __init__(self, x, y, batch_size=16):
-        self.x = x
-        self.y = y
+    def __init__(self, path, train_size=0.75, batch_size=16):
+        self.path = path
         self.batch_size = batch_size
+        self.train_size = train_size
 
-        self.augment_data()
-        self._randomize()
+        self.steering = pd.read_csv(os.path.join(path, "labels.csv"), header=None)
 
-        self.num_points = self.x.shape[0]
+        # randomize csv file
+        self.steering = self.steering.sample(frac=1).reset_index(drop=True)
 
-    def next_batch(self):
+        self.num_points = self.steering.shape[0]
+        self.n_batches = int(np.ceil(self.num_points/self.batch_size))
+
+    def next_batch(self, training=True):
         '''
             Yields a batch (x, y) of size `batch_size`
         '''
-        
-        # Calculate number of batches.
-        n_batches = int(np.ceil(self.num_points/self.batch_size))
+
+        ind = int(self.steering.shape[0] * self.train_size)
+        if training:
+            steering = self.steering[[0, 1]][: ind]
+        else:
+            steering = self.steering[[0, 1]][ind: ]
+        steering = steering.reset_index(drop=True)
+
+        num_points = steering.shape[0]
+        n_batches = int(np.ceil(num_points/self.batch_size))
         
         for b in range(n_batches):
             # Get start index of batch.
             start = b * self.batch_size
             
             # Get end index of batch.
-            end = start + self.batch_size
-            # Set limit to the ending index.
-            end = min(end, self.num_points)
+            end = min(num_points, start+self.batch_size)
+
+            # Read images from start: end
+            steering_batch = np.expand_dims(np.asarray(steering[1][start: end]), -1)
+            batch_files = steering[0][start: end].tolist()
+
+            batch_imgs = [np.array(Image.open(f)) for f in batch_files]
+            batch_imgs = [img[60: 140, :, :] for img in batch_imgs]
+            batch_imgs = [np.expand_dims(img, axis=0) for img in batch_imgs]
             
             # yielding will return a generator.
-            yield (self.X[start: end], self.Y[start: end])
+            yield np.concatenate(batch_imgs), steering_batch*90.0
 
-    def augment_data(self):
-        print("Performing data augmentation...")
-        
-        x_copy = np.copy(self.x)
-        y_copy = np.copy(self.y)
-
-        self._augment_flip()
-        self._augment_brightness()
-        
-        print("Done with augmentation!")
-
-    def _augment_flip(self):
-        '''
-        Augmentation function: 
-            Horizantally flips the images in dataset and negate the corresponding steering values.
-        '''
-        x_copy = np.copy(self.x)
-        y_copy = np.copy(self.y)
-
-        with tf.Session() as sess:
-            x_copy = sess.run(tf.map_fn(tf.image.flip_left_right, x_copy))
-        y_copy = -1.0 * y_copy
-
-        self.x = np.vstack((self.x, x_copy))
-        self.y = np.vstack((self.y, y_copy))
-
-    def _augment_brightness(self):
-        '''
-        Augmentation function: 
-            Randomly changes brightness of data. Steering value remains same.
-
-        Courtesy: https://chatbotslife.com/using-augmentation-to-mimic-human-driving-496b569760a9
-        '''
-        
-        x_copy = np.copy(self.x)
-        y_copy = np.copy(self.y)
-
-        with tf.Session() as sess:
-            x_copy = sess.run(tf.image.rgb_to_hsv(x_copy))
-
-            random_bright = 0.5+np.random.uniform()
-            x_copy[:, :, 2] = random_bright * x_copy[:, :, 2]
-            x_copy[:, :, 2][x_copy[:, :, 2]>255] = 255 # clip to 0-255
-
-            x_copy = sess.run(tf.image.hsv_to_rgb(x_copy))
-
-        self.x = np.vstack((self.x, x_copy))
-        self.y = np.vstack((self.y, y_copy))
-
-    def _randomize(self):
-        '''
-            Randomize the dataset.
-        '''
-        indices = np.arange(self.num_points)
-        np.random.shuffle(indices)
-        self.x = x[indices]
-        self.y = y[indices]
