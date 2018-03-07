@@ -6,8 +6,11 @@ Implementation of End to End Learning for Self-Driving Cars by Mariusz Bojarski 
 '''
 
 import os
+import sys
+from tqdm import tqdm
 import tensorflow as tf
 from helper import CnnParams, DenseParams, Data
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 class AutoSteer:
     def __init__(self, image_shape):
@@ -30,6 +33,8 @@ class AutoSteer:
 
         self.saver = tf.train.Saver()
 
+        self.tensorboard_op = tf.summary.merge_all()
+
     def build_model(self, image_shape):
         '''
         Builds the end to end self driving car model.
@@ -41,28 +46,27 @@ class AutoSteer:
 
         # Define input/output placeholders
         self.images = tf.placeholder(tf.float32, shape=(None, *image_shape), name='camera-view')
-        self.steering = tf.placeholder(tf.int32, shape=(None,), name='correct-steering')
+        self.steering = tf.placeholder(tf.int32, shape=(None, 1), name='correct-steering')
         self.keep_prob = tf.placeholder(tf.float32, name='keep-prob')
         self.is_training = tf.placeholder(tf.bool, name='is_training')
 
         # Define convolution architecture parameters.
         # Parameters : (kernel size, number of out channels, stride, padding)
         self.cnn_parameters = [
-            CnnParams(3, 16, 1, "VALID", tf.nn.elu),
-            CnnParams(3, 32, 1, "SAME", tf.nn.elu),
-            CnnParams(3, 64, 1, "VALID", tf.nn.elu),
+            CnnParams(5, 16, 2, "VALID", tf.nn.elu),
+            CnnParams(5, 32, 2, "VALID", tf.nn.elu),
+            CnnParams(5, 64, 2, "VALID", tf.nn.elu),
             CnnParams(3, 128, 1, "VALID", tf.nn.elu),
         ]
 
         # Define dense layers parameters.
         # Parameters : (num_units, activation, *dropout(keep prob))
         self.dense_parameters = [
-            DenseParams(256, tf.nn.elu, None),
-            DenseParams(128, tf.nn.elu, self.keep_prob),
+            DenseParams(1024, tf.nn.elu, None),
+            DenseParams(256, tf.nn.elu, self.keep_prob),
             DenseParams(64, tf.nn.elu, None),
-            DenseParams(32, tf.nn.elu, self.keep_prob),
-            DenseParams(8, tf.nn.elu, None),
-            DenseParams(3, tf.nn.softmax, None)
+            DenseParams(8, tf.nn.elu, self.keep_prob),
+            DenseParams(1, tf.nn.tanh, None)
         ]
 
         # Batch normalization layer
@@ -80,16 +84,17 @@ class AutoSteer:
         for i in range(len(self.dense_parameters)):
             layer = self.dense_layer(layer, i)
 
-        self.prediction = layer
+        self.prediction = layer * 90.0
 
         # Get image showing features extracted by CNN
         self.visualize = self.visualBackProp()
-        print(self.visualize)
 
     def define_loss(self):
-        self.loss = tf.losses.sparse_softmax_cross_entropy(labels=self.steering, logits=self.prediction)
+        # self.loss = tf.losses.sparse_softmax_cross_entropy(labels=self.steering, logits=self.prediction)
+        self.loss = tf.losses.mean_squared_error(labels=self.steering, predictions=self.prediction)
+        tf.summary.scalar("Mean-squared-loss", self.loss) # for tensorboard
 
-    def define_optimizer(self, learning_rate=0.001):
+    def define_optimizer(self, learning_rate=0.00001):
         update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
         with tf.control_dependencies(update_ops):
             self.train_step = tf.train.AdamOptimizer(learning_rate).minimize(self.loss)
@@ -176,7 +181,6 @@ class AutoSteer:
 
         # Get tensor operations of all conv layers
         cnn_ops = [tf.get_default_graph().get_tensor_by_name(cnn_op_name+":0") for cnn_op_name in cnn_op_names]
-        print(cnn_ops)
 
         with tf.variable_scope("VisualBackProp"):
             # calculate average feature map
@@ -213,40 +217,55 @@ class AutoSteer:
                 strides=[1, s, s, 1],
                 padding=cnn_param.padding)
         
-    def train(self, path, epochs=1000, log_step=10, resume=False):
+    def train(self, path, epochs=100, log_step=10, resume=False):
         '''
             Trains the end-to-end model on provided data.
             Args:
                 path : Path to dataset directory
         '''
 
-        x, y = self._read_data(path)
-        data = Data(x, y)
+        data = Data(path)
 
         with tf.Session() as session:
+            writer = tf.summary.FileWriter("for_tensorboard", session.graph)
+
+            resumed = False
             if resume:
-                if os.path.isfile(self.model_file):
+                try:
                     self.saver.restore(session, self.model_file)
-                else:
+                    resumed = True
+                    print("Resuming previous training...")
+                except:
                     print("No previous checkpoint file found, restarting training...")
+            
+            if not resumed:
+                session.run(tf.global_variables_initializer())
 
-            session.run(tf.global_variables_initializer())
-
-            for e in range(epochs):
-                avg_loss = 0.0
-                for batch_x, batch_y in data.next_batch():
-                    batch_loss, _ = session.run([self.loss, self.train_step], 
-                                    feed_dict={self.images: x, self.steering: y, self.is_training: True, self.keep_prob: 0.8})
-                    avg_loss += batch_loss
-
-                if e%log_step == 0:
-                    print("Average Mean squared loss for epoch {} = {}.".format(e, avg_loss))
+            try:
+                for e in range(epochs):
+                    loss_sum = 0.0
+                    for batch_x, batch_y in data.next_batch():
+                        batch_loss, _, tb_op = session.run([self.loss, self.train_step, self.tensorboard_op], 
+                                        feed_dict={self.images: batch_x, self.steering: batch_y, self.is_training: True, self.keep_prob: 0.8})
+                        loss_sum += batch_loss
                     
-                    # Save the model state
-                    fname = self.saver.save(session, self.model_file)
-                    print("Session saved in {}".format(fname))
+                    print("Sum of Mean squared losses for epoch {} = {}.".format(e, loss_sum))
+                    
+                    if e%10 == 0:
+                        writer.add_summary(tb_op, e)
+
+                        # Save the model state
+                        fname = self.saver.save(session, self.model_file)
+                        print("Session saved in {}".format(fname))
+
+            except KeyboardInterrupt:
+                pass
+
+            writer.close()
 
         print("Training complete!")
+
+        self.evaluate(data)
 
     def predict(self, x):
         '''
@@ -264,25 +283,34 @@ class AutoSteer:
 
         return prediction
 
+    def evaluate(self, data):
+        avg_loss = 0.0
+        c=0
+        with tf.Session() as session:
+            self.saver.restore(session, self.model_file)
+            for batch_x, batch_y in data.next_batch(training=False):
+                batch_loss = session.run(self.loss, 
+                    feed_dict={self.images: batch_x, self.steering: batch_y, self.is_training: False, self.keep_prob: 1.0})
+                avg_loss = avg_loss + batch_loss
+                c+=1
+            print("Average loss on given test data: {}".format(avg_loss/c))
+
+    def get_visual_mask(self, x):
+        '''
+            Get visual mask according to VisualBackProp algorithm.
+        '''
+        with tf.Session() as session:
+            self.saver.restore(session, self.model_file)
+            prediction = session.run(self.visualize, 
+                                    feed_dict={self.images: x, self.is_training: False})
+
+        return prediction
+
     def weight(self, name, shape):
         return tf.get_variable(name, shape)
 
     def bias(self, name, shape):
         return tf.get_variable(name, shape, initializer=tf.constant_initializer(0.1))
-
-    def _read_data(self, path):
-        '''
-            Reads dataset from directory.
-            Args:
-                path : Path to dataset directory.
-            Returns:
-                (x, y) tuple where:
-                    x : Numpy array of shape (Batch, Height, Width, Channels)
-                    y : Numpy array of shape (Batch, 1)
-        '''
-        assert os.path.isdir(path), "{} is not a valid directory.".format(path)
-
-        raise NotImplementedError
 
     def __str__(self):
         s = ""
@@ -293,4 +321,34 @@ class AutoSteer:
 
 # Testing
 if __name__ == '__main__':
-    autoSteer = AutoSteer((256, 256, 4))
+    autoSteer = AutoSteer((80, 320, 3))
+    # autoSteer.train(sys.argv[1], epochs=1000, resume=True)
+
+    import numpy as np
+    from PIL import Image
+    import matplotlib.pyplot as plt
+
+    fname = "/home/malcolm/Desktop/udacity-self-driving-car-data/IMG/center_2018_03_05_18_44_35_920_flipped.jpg"
+    img = np.array(Image.open(fname))
+    img = img[60: 140, :, :]
+    img = np.expand_dims(img, axis=0)
+
+    # with tf.Session() as session:
+    #     img = session.run(tf.image.adjust_brightness(img, 0.3))
+
+    mask = autoSteer.get_visual_mask(img)
+    print(mask.shape)
+
+    out = autoSteer.predict(img)
+    print(out/90.0)
+    img = np.squeeze(img)
+
+    print(img.shape)
+    
+    plt.subplot(121)
+    plt.imshow(img)
+
+    plt.subplot(122)
+    plt.imshow(np.squeeze(mask))
+
+    plt.show()
